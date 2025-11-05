@@ -1,0 +1,324 @@
+"""
+tracker_app.py
+
+FastAPI backend that:
+- Polls QuiverQuant and FinancialModelingPrep
+- Stores filings in SQLite
+- Broadcasts new filings to clients using Server-Sent Events (SSE)
+- Offers simple UI endpoints (templates/)
+"""
+import os
+import asyncio
+import json
+import logging
+from typing import List, Dict, Any, Optional, Set
+from datetime import datetime, timezone
+
+import httpx
+import aiosqlite
+from dotenv import load_dotenv
+from fastapi import FastAPI, Request, Form
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+
+load_dotenv()
+
+# Config
+DB_PATH = os.getenv("TRACKER_DB", "tracker.db")
+QUIVER_API_KEY = os.getenv("QUIVER_API_KEY")
+FMP_API_KEY = os.getenv("FMP_API_KEY")
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL")
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SECONDS", "30"))
+RUN_POLLER = os.getenv("RUN_POLLER", "true").lower() in ("1", "true", "yes")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+
+# Logging
+logging.basicConfig(level=LOG_LEVEL)
+logger = logging.getLogger("investmenttracker")
+
+# People to feature by default (you can expand)
+FEATURE_PEOPLE = [
+    # Lawmakers (example top-earners)
+    "Nancy Pelosi", "Michael McCaul", "Ro Khanna", "Brian Higgins", "Daniel Goldman",
+    # Investors / funds
+    "Warren Buffett", "Michael Burry", "Bill Ackman", "Carl Icahn", "George Soros",
+]
+
+# Global runtime state
+user_selected_people: List[str] = []  # in-memory selection for simple demo
+broadcast_queues: Set[asyncio.Queue] = set()
+
+QUIVER_CONGRESS_URL = "https://api.quiverquant.com/beta/historical/congresstrading"
+FMP_13F_URL = "https://financialmodelingprep.com/api/v4/institutional-ownership-filings"
+
+app = FastAPI(title="PTR & Investor Tracker")
+app.mount("/static", StaticFiles(directory="static"), name="static")
+templates = Jinja2Templates(directory="templates")
+
+# Utilities ------------------------------------------------------------------
+
+
+async def ensure_db_dir(path: str) -> None:
+    dirpath = os.path.dirname(path) or "."
+    if dirpath and not os.path.exists(dirpath):
+        os.makedirs(dirpath, exist_ok=True)
+        logger.info("Created DB directory %s", dirpath)
+
+
+async def init_db():
+    await ensure_db_dir(DB_PATH)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS filings (
+                id TEXT PRIMARY KEY,
+                person TEXT,
+                ticker TEXT,
+                side TEXT,
+                amount TEXT,
+                reported_date TEXT,
+                source TEXT,
+                seen_at TEXT
+            )
+            """
+        )
+        await db.commit()
+    logger.info("Database initialized at %s", DB_PATH)
+
+
+async def notify_discord(new_filings: List[Dict[str, Any]]):
+    if not DISCORD_WEBHOOK or not new_filings:
+        return
+    lines = [f"{f.get('reported_date','')} | {f.get('person','')} | {f.get('ticker','')} | {f.get('side','')} | {f.get('amount','')}" for f in new_filings]
+    payload = {"content": "**New Filings**\n" + "\n".join(lines)}
+    async with httpx.AsyncClient() as client:
+        try:
+            await client.post(DISCORD_WEBHOOK, json=payload, timeout=10)
+        except Exception as e:
+            logger.warning("Discord notify failed: %s", e)
+
+
+async def store_new_entries(new_filings: List[Dict[str, Any]]):
+    if not new_filings:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        for f in new_filings:
+            try:
+                await db.execute(
+                    "INSERT INTO filings (id, person, ticker, side, amount, reported_date, source, seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        f["id"],
+                        f.get("person", ""),
+                        f.get("ticker", ""),
+                        f.get("side", ""),
+                        f.get("amount", ""),
+                        f.get("reported_date", ""),
+                        f.get("source", ""),
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
+                await db.commit()
+            except aiosqlite.IntegrityError:
+                # already exists
+                continue
+    # broadcast and notify externally
+    await broadcast_new_filings(new_filings)
+    await notify_discord(new_filings)
+
+
+# SSE broadcast --------------------------------------------------------------
+
+
+async def broadcast_new_filings(new_filings: List[Dict[str, Any]]):
+    if not new_filings:
+        return
+    message = json.dumps({"type": "new_filings", "data": new_filings}, default=str)
+    dead = set()
+    for q in list(broadcast_queues):
+        try:
+            await q.put(message)
+        except Exception:
+            dead.add(q)
+    for q in dead:
+        broadcast_queues.discard(q)
+
+
+async def sse_event_generator(q: asyncio.Queue):
+    try:
+        while True:
+            msg = await q.get()
+            yield f"data: {msg}\n\n"
+    except asyncio.CancelledError:
+        return
+
+
+@app.get("/events")
+async def events():
+    """
+    Server-Sent Events endpoint. Browsers connect via EventSource to receive real-time filings.
+    """
+    q: asyncio.Queue = asyncio.Queue()
+    broadcast_queues.add(q)
+
+    async def generator():
+        try:
+            # send a ping/welcome event first
+            await q.put(json.dumps({"type": "hello", "time": datetime.now(timezone.utc).isoformat()}))
+            async for chunk in sse_event_generator(q):
+                yield chunk
+        finally:
+            # cleanup
+            try:
+                broadcast_queues.discard(q)
+            except Exception:
+                pass
+
+    return StreamingResponse(generator(), media_type="text/event-stream")
+
+
+# Data fetchers --------------------------------------------------------------
+
+
+async def fetch_quiver_filings(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
+    if not QUIVER_API_KEY or not user_selected_people:
+        return []
+    headers = {"Authorization": f"Token {QUIVER_API_KEY}"}
+    try:
+        resp = await client.get(QUIVER_CONGRESS_URL, headers=headers, timeout=20.0)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        logger.debug("Quiver fetch error: %s", e)
+        return []
+    filings = []
+    for item in data:
+        person = item.get("representative") or item.get("member") or ""
+        if not any(name.lower() in person.lower() for name in user_selected_people):
+            continue
+        fid = item.get("transaction_id") or f"{person}_{item.get('ticker','')}_{item.get('date','')}"
+        filings.append({
+            "id": str(fid),
+            "person": person,
+            "ticker": item.get("ticker", ""),
+            "side": (item.get("type") or "").lower(),
+            "amount": item.get("amount") or item.get("range") or "",
+            "reported_date": item.get("date", ""),
+            "source": "quiver",
+        })
+    return filings
+
+
+async def fetch_fmp_filings(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
+    if not FMP_API_KEY or not user_selected_people:
+        return []
+    try:
+        resp = await client.get(f"{FMP_13F_URL}?apikey={FMP_API_KEY}", timeout=20.0)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        logger.debug("FMP fetch error: %s", e)
+        return []
+    filings = []
+    for item in data:
+        name = item.get("name", "")
+        if not any(name_to_check.lower() in name.lower() for name_to_check in user_selected_people):
+            continue
+        fid = item.get("cik") or f"{name}_{item.get('symbol','')}_{item.get('filingDate','')}"
+        filings.append({
+            "id": str(fid),
+            "person": name,
+            "ticker": item.get("symbol", ""),
+            "side": "hold",
+            "amount": str(item.get("value", "")),
+            "reported_date": item.get("filingDate", ""),
+            "source": "fmp",
+        })
+    return filings
+
+
+async def poll_loop():
+    """
+    Long-running poller task. If RUN_POLLER is false, it's not started.
+    """
+    await init_db()
+    client = httpx.AsyncClient()
+    try:
+        while True:
+            try:
+                quiver = await fetch_quiver_filings(client)
+                fmp = await fetch_fmp_filings(client)
+                all_filings = (quiver or []) + (fmp or [])
+                if all_filings:
+                    # find new entries against DB
+                    new_entries = []
+                    async with aiosqlite.connect(DB_PATH) as db:
+                        for f in all_filings:
+                            cur = await db.execute("SELECT 1 FROM filings WHERE id = ?", (f["id"],))
+                            if not await cur.fetchone():
+                                new_entries.append(f)
+                    if new_entries:
+                        logger.info("Storing %d new filings", len(new_entries))
+                        await store_new_entries(new_entries)
+                # polite sleep
+            except Exception as e:
+                logger.exception("Poll loop error: %s", e)
+            await asyncio.sleep(POLL_INTERVAL)
+    finally:
+        await client.aclose()
+
+
+# Routes / UI ---------------------------------------------------------------
+
+
+@app.on_event("startup")
+async def startup_event():
+    # ensure DB ready
+    await init_db()
+    # start poller task if desired
+    if RUN_POLLER:
+        app.state.poll_task = asyncio.create_task(poll_loop())
+        logger.info("Poller started (RUN_POLLER=%s)", RUN_POLLER)
+    else:
+        logger.info("RUN_POLLER is false; poller not started")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    task = getattr(app.state, "poll_task", None)
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    logger.info("Shutdown complete")
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index(request: Request):
+    # Show featured people by default and last 50 filings
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT person, ticker, side, amount, reported_date, source FROM filings ORDER BY seen_at DESC LIMIT 50")
+        rows = await cur.fetchall()
+    return templates.TemplateResponse("index.html", {"request": request, "featured": FEATURE_PEOPLE, "rows": rows, "selected": user_selected_people})
+
+
+@app.post("/set_people")
+async def set_people(selected: List[str] = Form(...)):
+    global user_selected_people
+    user_selected_people = selected
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.get("/api/recent")
+async def api_recent(limit: int = 50):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT person, ticker, side, amount, reported_date, source FROM filings ORDER BY seen_at DESC LIMIT ?", (limit,))
+        rows = await cur.fetchall()
+    return JSONResponse(content={"rows": [list(r) for r in rows]})
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
