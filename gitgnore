@@ -1,0 +1,16 @@
+# General
+.DS_Store
+.env
+.vscode/
+.idea/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.env
+
+# SQLite DB
+*.db
