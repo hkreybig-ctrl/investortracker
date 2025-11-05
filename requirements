@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+httpx
+aiosqlite
+python-dotenv
+jinja2
+pydantic
+feedparser
