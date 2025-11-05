@@ -1,0 +1,38 @@
+```markdown
+# Investment Tracker (PTR & 13F) — Real-time
+
+This project tracks public filings from lawmakers (PTR/congressional trading) and large institutional investors (13F filings), broadcasts new filings in real time to connected browsers, and provides a simple, clean UI.
+
+Important: This is not financial advice. Use for informational/educational purposes.
+
+Quick start (local)
+1. Copy `.env.example` -> `.env` and fill QUIVER_API_KEY and FMP_API_KEY.
+2. Create virtualenv and install:
+   python -m venv .venv
+   source .venv/bin/activate
+   pip install -r requirements.txt
+3. Run locally (web + poller in same process; for production use RUN_POLLER gating):
+   export RUN_POLLER=true
+   uvicorn tracker_app:app --host 0.0.0.0 --port 8000 --reload
+4. Visit http://127.0.0.1:8000
+
+Render deployment notes
+- Use a Render Web Service for the UI (RUN_POLLER=false).
+- Use a Render Worker (or a second Web Service) for the poller (RUN_POLLER=true).
+- Attach a Render Persistent Disk and set TRACKER_DB to the disk path (e.g., /data/tracker.db).
+- Configure QUIVER_API_KEY and FMP_API_KEY in Render environment variables.
+
+Files of interest
+- tracker_app.py — FastAPI app, poller, SSE broadcasting
+- templates/index.html — frontend
+- static/* — CSS + JS for live updates
+- Dockerfile / render.yaml — deployment helpers
+
+Security & best practices
+- Do not commit `.env` or API keys.
+- SQLite concurrency: if you have both web + worker hitting the DB concurrently, consider using Postgres for production. SQLite may work with WAL mode, but Postgres is recommended.
+- Respect API rate limits; increase POLL_INTERVAL_SECONDS if needed.
+
+Contact / next steps
+- I can add authentication, user accounts, persistent portfolios, or migration to Postgres and webhooks if you prefer.
+```
