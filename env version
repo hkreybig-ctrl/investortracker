@@ -1,0 +1,9 @@
+# Copy to .env and fill values. DO NOT commit .env
+QUIVER_API_KEY=your_quiver_api_key
+FMP_API_KEY=your_financial_modeling_prep_api_key
+DISCORD_WEBHOOK_URL=your_discord_webhook_url_optional
+# For persistent DB on Render use '/data/tracker.db'
+TRACKER_DB=tracker.db
+POLL_INTERVAL_SECONDS=30
+RUN_POLLER=false
+LOG_LEVEL=INFO
