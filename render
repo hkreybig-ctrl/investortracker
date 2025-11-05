@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: investmenttracker-web
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn tracker_app:app --host 0.0.0.0 --port $PORT --proxy-headers
+    envVars:
+      - key: RUN_POLLER
+        value: "false"
+  - type: worker
+    name: investmenttracker-worker
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -c "import asyncio, tracker_app; asyncio.run(tracker_app.poll_loop())"
+    envVars:
+      - key: RUN_POLLER
+        value: "true"
+# Note: in the Render dashboard, attach a Persistent Disk and set TRACKER_DB=/data/tracker.db for both services.
